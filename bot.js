@@ -6,7 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const https = require('https');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const PIXEL_ID = process.env.META_PIXEL_ID || "1099322255975263";
 const AUTH_DIR = path.join(__dirname, 'auth_info_cloud');
 let META_TOKEN = process.env.META_ACCESS_TOKEN || "";
@@ -267,7 +267,7 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`[Cloud Bot] HTTP Server listening on port ${PORT}`);
     startWhatsApp().catch(err => console.error('[Cloud Bot Fatal]', err));
 });
