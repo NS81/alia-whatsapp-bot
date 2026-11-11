@@ -122,20 +122,29 @@ async function startWhatsApp() {
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        if (qr) currentQR = qr;
+        if (qr) {
+            currentQR = qr;
+            console.log('[Cloud Bot] 🎯 QR Code received from WhatsApp! Ready for scanning.');
+        }
 
         if (connection === 'close') {
             connectionStatus = "DISCONNECTED";
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log('[Cloud Bot] Connection closed. StatusCode:', statusCode);
-            const isRegistered = sock?.authState?.creds?.registered;
-            if (!isRegistered) {
-                console.log('[Cloud Bot] Pairing failed or timed out. Clearing stale auth dir...');
+            
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                console.log('[Cloud Bot] Reconnecting socket in 3 seconds...');
+                setTimeout(() => {
+                    startWhatsApp().catch(err => console.error('[Restart Error]', err));
+                }, 3000);
+            } else {
+                console.log('[Cloud Bot] Session logged out. Resetting auth dir...');
                 try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+                setTimeout(() => {
+                    startWhatsApp().catch(err => console.error('[Restart Error]', err));
+                }, 3000);
             }
-            setTimeout(() => {
-                startWhatsApp().catch(err => console.error('[Restart Error]', err));
-            }, 3000);
         } else if (connection === 'open') {
             connectionStatus = "CONNECTED";
             currentPairingCode = null;
@@ -332,7 +341,7 @@ const server = http.createServer(async (req, res) => {
 
             if (!sock || connectionStatus === "DISCONNECTED") {
                 console.log('[Cloud Bot] Starting clean WhatsApp socket for pairing...');
-                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){} 
                 await startWhatsApp();
                 await new Promise(r => setTimeout(r, 4000));
             }
@@ -342,7 +351,7 @@ const server = http.createServer(async (req, res) => {
                 code = await sock.requestPairingCode(cleanPhone);
             } catch (firstErr) {
                 console.log('[Cloud Bot] Initial code request failed, retrying with fresh socket:', firstErr.message);
-                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){} 
                 await startWhatsApp();
                 await new Promise(r => setTimeout(r, 4000));
                 code = await sock.requestPairingCode(cleanPhone);
