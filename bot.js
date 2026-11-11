@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const http = require('http');
 const path = require('path');
@@ -90,36 +90,56 @@ function sendMetaPurchase(phone, amount, packageTitle) {
         req.end();
     });
 }
-
 let sock = null;
 let currentPairingCode = null;
 let connectionStatus = "INITIALIZING";
 
+let currentQR = null;
+
 async function startWhatsApp() {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
+    let version = [2, 3000, 1015901307];
+    try {
+        const fetched = await fetchLatestBaileysVersion();
+        if (fetched?.version) version = fetched.version;
+    } catch(e) {
+        console.log('[Cloud Bot] Using fallback Baileys version');
+    }
 
     sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
         auth: state,
         printQRInTerminal: false,
-        browser: ['Gloramous Cloud AI', 'Chrome', '1.0.0']
+        browser: Browsers.macOS('Desktop'),
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) currentQR = qr;
+
         if (connection === 'close') {
             connectionStatus = "DISCONNECTED";
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('[Cloud Bot] Connection closed. Reconnecting...', shouldReconnect);
-            if (shouldReconnect) startWhatsApp();
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            console.log('[Cloud Bot] Connection closed. StatusCode:', statusCode);
+            const isRegistered = sock?.authState?.creds?.registered;
+            if (!isRegistered) {
+                console.log('[Cloud Bot] Pairing failed or timed out. Clearing stale auth dir...');
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+            }
+            setTimeout(() => {
+                startWhatsApp().catch(err => console.error('[Restart Error]', err));
+            }, 3000);
         } else if (connection === 'open') {
             connectionStatus = "CONNECTED";
             currentPairingCode = null;
+            currentQR = null;
             console.log('\n======================================================');
             console.log('  🎉 GLORAMOUS 24/7 CLOUD BOT CONNECTED TO WHATSAPP!');
             console.log(`  JID: ${sock.user?.id}`);
@@ -145,7 +165,6 @@ async function startWhatsApp() {
             const trigger1 = /order\s*confirm(?:ed)?/i.test(text);
             const trigger2 = /تم\s*(?:تأكيد|تاكيد)\s*الطلب/i.test(text);
             const trigger3 = /تم\s*(?:التأكيد|التاكيد)/i.test(text);
-
             if (trigger1 || trigger2 || trigger3) {
                 console.log(`[Cloud Bot] 🎯 Order Trigger: "${text.trim()}" in ${remoteJid}`);
 
@@ -214,7 +233,6 @@ async function startWhatsApp() {
         }
     });
 }
-
 const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
 
@@ -228,38 +246,59 @@ const server = http.createServer(async (req, res) => {
             has_pairing_code: !!currentPairingCode
         }));
     } else if (parsedUrl.pathname === '/pair') {
-        const phone = parsedUrl.searchParams.get('phone');
-        if (!phone) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(`<h2>Usage: /pair?phone=96176xxxxxx</h2>`);
-            return;
-        }
+        const phone = parsedUrl.searchParams.get('phone') || "96176954792";
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
 
         try {
-            const cleanPhone = phone.replace(/[^0-9]/g, '');
-            if (!sock || (sock.authState && sock.authState.creds && sock.authState.creds.registered)) {
+            if (sock?.authState?.creds?.registered) {
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                res.end(`<h3>Bot is already registered and connected!</h3>`);
+                res.end(`<h2 style="font-family:sans-serif; text-align:center; padding:50px; color:#25d366;">🎉 WhatsApp Bot is ALREADY CONNECTED to +${cleanPhone}!</h2>`);
                 return;
             }
 
-            const code = await sock.requestPairingCode(cleanPhone);
+            if (!sock || connectionStatus === "DISCONNECTED") {
+                console.log('[Cloud Bot] Starting clean WhatsApp socket for pairing...');
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+                await startWhatsApp();
+                await new Promise(r => setTimeout(r, 4000));
+            }
+
+            let code;
+            try {
+                code = await sock.requestPairingCode(cleanPhone);
+            } catch (firstErr) {
+                console.log('[Cloud Bot] Initial code request failed, retrying with fresh socket:', firstErr.message);
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+                await startWhatsApp();
+                await new Promise(r => setTimeout(r, 4000));
+                code = await sock.requestPairingCode(cleanPhone);
+            }
+
             currentPairingCode = code;
 
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(`
-                <div style="font-family:sans-serif; text-align:center; padding:40px; background:#0c111d; color:#fff; min-height:100vh;">
-                  <h1 style="color:#25d366;">WhatsApp Pairing Code</h1>
-                  <p style="font-size:18px;">Enter this code on Alia's phone:</p>
-                  <div style="font-size:36px; font-weight:900; letter-spacing:4px; padding:20px; background:#161f30; border-radius:12px; display:inline-block; border:2px solid #25d366; margin:20px 0;">
-                    ${code}
+                <div style="font-family:sans-serif; text-align:center; padding:40px 20px; background:#0c111d; color:#fff; min-height:100vh;">
+                  <h1 style="color:#25d366; margin-bottom:5px;">Gloramous WhatsApp Cloud Link</h1>
+                  <p style="font-size:16px; color:#94a3b8;">Enter this code on Alia's phone (+${cleanPhone}):</p>
+                  
+                  <div style="margin:25px 0;">
+                    <div style="font-size:46px; font-weight:900; letter-spacing:6px; padding:20px 35px; background:#161f30; border-radius:12px; display:inline-block; border:2px solid #25d366; color:#fff;">
+                      ${code}
+                    </div>
+                    <p style="color:#cbd5e1; margin-top:15px; font-size:15px;">WhatsApp ➔ Settings ➔ Linked Devices ➔ Link a Device ➔ "Link with phone number instead"</p>
                   </div>
-                  <p style="color:#94a3b8;">WhatsApp ➔ Linked Devices ➔ Link a Device ➔ Link with phone number ➔ Enter code.</p>
                 </div>
             `);
         } catch (err) {
-            res.writeHead(500, { 'Content-Type': 'text/plain' });
-            res.end('Error requesting code: ' + err.message);
+            res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(`
+              <div style="font-family:sans-serif; text-align:center; padding:50px; background:#0c111d; color:#fff; min-height:100vh;">
+                <h2 style="color:#f87171;">Pairing initialization in progress...</h2>
+                <p>The socket is refreshing. Please refresh this page in 3 seconds.</p>
+                <button onclick="window.location.reload()" style="padding:12px 24px; font-size:16px; background:#25d366; color:#000; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">Refresh Now</button>
+              </div>
+            `);
         }
     } else {
         res.writeHead(404);
