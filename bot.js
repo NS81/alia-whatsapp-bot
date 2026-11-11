@@ -90,11 +90,12 @@ function sendMetaPurchase(phone, amount, packageTitle) {
         req.end();
     });
 }
+
 let sock = null;
 let currentPairingCode = null;
 let connectionStatus = "INITIALIZING";
-let currentQR = null;
 
+let currentQR = null;
 async function startWhatsApp() {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -127,13 +128,14 @@ async function startWhatsApp() {
             connectionStatus = "DISCONNECTED";
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log('[Cloud Bot] Connection closed. StatusCode:', statusCode);
-            if (statusCode === DisconnectReason.loggedOut) {
-                console.log('[Cloud Bot] Logged out. Clearing auth dir...');
+            const isRegistered = sock?.authState?.creds?.registered;
+            if (!isRegistered) {
+                console.log('[Cloud Bot] Pairing failed or timed out. Clearing stale auth dir...');
                 try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
             }
             setTimeout(() => {
                 startWhatsApp().catch(err => console.error('[Restart Error]', err));
-            }, 5000);
+            }, 3000);
         } else if (connection === 'open') {
             connectionStatus = "CONNECTED";
             currentPairingCode = null;
@@ -163,6 +165,7 @@ async function startWhatsApp() {
             const trigger1 = /order\s*confirm(?:ed)?/i.test(text);
             const trigger2 = /تم\s*(?:تأكيد|تاكيد)\s*الطلب/i.test(text);
             const trigger3 = /تم\s*(?:التأكيد|التاكيد)/i.test(text);
+
             if (trigger1 || trigger2 || trigger3) {
                 console.log(`[Cloud Bot] 🎯 Order Trigger: "${text.trim()}" in ${remoteJid}`);
 
@@ -187,7 +190,6 @@ async function startWhatsApp() {
                     continue;
                 }
                 recentSyncs.set(cleanKey, now);
-
                 let amount = 120;
                 let packageTitle = "Twin Set ($120)";
 
@@ -231,18 +233,92 @@ async function startWhatsApp() {
         }
     });
 }
+
 const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
 
     if (parsedUrl.pathname === '/') {
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({
-            status: "online",
-            bot_connection: connectionStatus,
-            pixel_id: PIXEL_ID,
-            uptime_seconds: Math.floor(process.uptime()),
-            has_pairing_code: !!currentPairingCode
-        }));
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        
+        if (connectionStatus === "CONNECTED") {
+            res.end(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <meta charset="UTF-8">
+                  <title>Gloramous Meta Sync | Connected</title>
+                  <style>
+                    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0c111d; color: #fff; text-align: center; padding: 50px 20px; }
+                    .card { background: #161f30; max-width: 500px; margin: 0 auto; padding: 40px; border-radius: 16px; border: 2px solid #25d366; }
+                    .badge { display: inline-block; background: #064e3b; color: #34d399; padding: 8px 18px; border-radius: 20px; font-weight: bold; margin-bottom: 20px; }
+                  </style>
+                </head>
+                <body>
+                  <div class="card">
+                    <div class="badge">🟢 24/7 Meta Ads Sync Active</div>
+                    <h1 style="color:#25d366;">Cloud Bot Connected!</h1>
+                    <p style="color:#94a3b8; font-size:16px;">WhatsApp account is linked securely to Meta Pixel <b>${PIXEL_ID}</b>.</p>
+                    <div style="background:#0c111d; border-radius:10px; padding:15px; margin-top:20px; font-size:14px; color:#cbd5e1; text-align:left;">
+                      🔒 <b>100% Privacy Protected:</b><br>
+                      • No personal messages, calls, or chats are visible to anyone.<br>
+                      • The bot runs headlessly in code with zero screen/interface.<br>
+                      • Only confirmed order amounts ($180, $120, $70, $40) are converted to Meta Purchase events.
+                    </div>
+                  </div>
+                </body>
+                </html>
+            `);
+            return;
+        }
+
+        let qrSection = '';
+        if (currentQR) {
+            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(currentQR)}`;
+            qrSection = `
+              <div style="margin:20px auto; background:#fff; padding:15px; border-radius:12px; display:inline-block;">
+                <img src="${qrUrl}" width="260" height="260" alt="WhatsApp QR Code" />
+              </div>
+              <p style="color:#cbd5e1; font-size:15px;">Open WhatsApp on phone ➔ <b>Settings</b> ➔ <b>Linked Devices</b> ➔ <b>Link a Device</b> ➔ Scan this QR</p>
+            `;
+        } else {
+            qrSection = `
+              <div style="padding:40px; background:#161f30; border-radius:12px; display:inline-block; margin:20px auto;">
+                <p style="color:#38bdf8; font-size:18px;">Initializing secure connection to WhatsApp...</p>
+                <p style="color:#94a3b8; font-size:14px;">Refreshing automatically in 3 seconds...</p>
+              </div>
+            `;
+        }
+        res.end(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <meta charset="UTF-8">
+              <meta http-equiv="refresh" content="5">
+              <title>Gloramous Meta Sync Gateway</title>
+              <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0c111d; color: #fff; text-align: center; padding: 40px 15px; }
+                .card { background: #161f30; max-width: 520px; margin: 0 auto; padding: 35px; border-radius: 16px; border: 1px solid #1f2a3d; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+                h1 { color: #25d366; font-size: 24px; margin-bottom: 5px; }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>Gloramous Meta Ads Tracking</h1>
+                <p style="color:#94a3b8; font-size:15px;">Private Headless Cloud Gateway</p>
+                
+                ${qrSection}
+
+                <div style="background:#0c111d; border-radius:10px; padding:15px; margin-top:25px; font-size:13px; color:#94a3b8; text-align:left;">
+                  🔒 <b>Alia's Privacy Guarantee:</b><br>
+                  • Nobody can view, read, or access your personal conversations.<br>
+                  • This bot runs headlessly in the cloud with zero screen or chat history.<br>
+                  • It only listens for order confirmation texts to report ad performance to Meta.
+                </div>
+              </div>
+            </body>
+            </html>
+        `);
+        return;
     } else if (parsedUrl.pathname === '/pair') {
         const phone = parsedUrl.searchParams.get('phone') || "96176954792";
         const cleanPhone = phone.replace(/[^0-9]/g, '');
@@ -256,6 +332,7 @@ const server = http.createServer(async (req, res) => {
 
             if (!sock || connectionStatus === "DISCONNECTED") {
                 console.log('[Cloud Bot] Starting clean WhatsApp socket for pairing...');
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
                 await startWhatsApp();
                 await new Promise(r => setTimeout(r, 4000));
             }
@@ -264,8 +341,10 @@ const server = http.createServer(async (req, res) => {
             try {
                 code = await sock.requestPairingCode(cleanPhone);
             } catch (firstErr) {
-                console.log('[Cloud Bot] Pairing request retrying:', firstErr.message);
-                await new Promise(r => setTimeout(r, 3000));
+                console.log('[Cloud Bot] Initial code request failed, retrying with fresh socket:', firstErr.message);
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
+                await startWhatsApp();
+                await new Promise(r => setTimeout(r, 4000));
                 code = await sock.requestPairingCode(cleanPhone);
             }
 
