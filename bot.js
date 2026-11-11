@@ -93,7 +93,6 @@ function sendMetaPurchase(phone, amount, packageTitle) {
 let sock = null;
 let currentPairingCode = null;
 let connectionStatus = "INITIALIZING";
-
 let currentQR = null;
 
 async function startWhatsApp() {
@@ -128,14 +127,13 @@ async function startWhatsApp() {
             connectionStatus = "DISCONNECTED";
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log('[Cloud Bot] Connection closed. StatusCode:', statusCode);
-            const isRegistered = sock?.authState?.creds?.registered;
-            if (!isRegistered) {
-                console.log('[Cloud Bot] Pairing failed or timed out. Clearing stale auth dir...');
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log('[Cloud Bot] Logged out. Clearing auth dir...');
                 try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
             }
             setTimeout(() => {
                 startWhatsApp().catch(err => console.error('[Restart Error]', err));
-            }, 3000);
+            }, 5000);
         } else if (connection === 'open') {
             connectionStatus = "CONNECTED";
             currentPairingCode = null;
@@ -258,7 +256,6 @@ const server = http.createServer(async (req, res) => {
 
             if (!sock || connectionStatus === "DISCONNECTED") {
                 console.log('[Cloud Bot] Starting clean WhatsApp socket for pairing...');
-                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
                 await startWhatsApp();
                 await new Promise(r => setTimeout(r, 4000));
             }
@@ -267,10 +264,8 @@ const server = http.createServer(async (req, res) => {
             try {
                 code = await sock.requestPairingCode(cleanPhone);
             } catch (firstErr) {
-                console.log('[Cloud Bot] Initial code request failed, retrying with fresh socket:', firstErr.message);
-                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch(e){}
-                await startWhatsApp();
-                await new Promise(r => setTimeout(r, 4000));
+                console.log('[Cloud Bot] Pairing request retrying:', firstErr.message);
+                await new Promise(r => setTimeout(r, 3000));
                 code = await sock.requestPairingCode(cleanPhone);
             }
 
