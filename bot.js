@@ -98,13 +98,35 @@ let connectionStatus = "INITIALIZING";
 let currentQR = null;
 async function startWhatsApp() {
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+    if (process.env.WA_SESSION) {
+        try {
+            const rawSession = process.env.WA_SESSION.trim();
+            const decoded = Buffer.from(rawSession, 'base64').toString('utf-8');
+            if (decoded.trim().startsWith('{')) {
+                const parsed = JSON.parse(decoded);
+                if (parsed.noiseKey || parsed.registrationId || parsed.me) {
+                    fs.writeFileSync(path.join(AUTH_DIR, 'creds.json'), decoded, 'utf-8');
+                    console.log('[Cloud Bot] ✅ Restored creds.json from WA_SESSION');
+                } else {
+                    for (const [filename, content] of Object.entries(parsed)) {
+                        fs.writeFileSync(path.join(AUTH_DIR, filename), typeof content === 'string' ? content : JSON.stringify(content), 'utf-8');
+                    }
+                    console.log('[Cloud Bot] ✅ Restored multi-file session bundle from WA_SESSION');
+                }
+            }
+        } catch (err) {
+            console.error('[Cloud Bot] ⚠️ WA_SESSION parsing error:', err.message);
+        }
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    let version = [2, 3000, 1015901307];
+    let version = [2, 3000, 1043857760];
     try {
         const fetched = await fetchLatestBaileysVersion();
         if (fetched?.version) version = fetched.version;
     } catch(e) {
-        console.log('[Cloud Bot] Using fallback Baileys version');
+        console.log('[Cloud Bot] Using modern fallback Baileys version');
     }
 
     sock = makeWASocket({
@@ -112,7 +134,7 @@ async function startWhatsApp() {
         logger: pino({ level: 'silent' }),
         auth: state,
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
+        browser: Browsers.ubuntu('Chrome'),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 10000
