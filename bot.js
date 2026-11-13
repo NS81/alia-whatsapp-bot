@@ -17,15 +17,31 @@ const RENDER_SERVICE_ID = (process.env.RENDER_SERVICE_ID || "").trim();
 const ADMIN_KEY = (process.env.BOT_ADMIN_KEY || (META_TOKEN ? META_TOKEN.slice(-12) : "gloramous_admin")).trim();
 
 // In-memory stores (backed by Upstash Redis when configured)
-const recentSyncs = new Map();      // cleanPhone -> timestamp (6h dedup)
+const recentSyncs = new Map();      // cleanPhone -> timestamp (6h Purchase dedup)
+const leadSyncs = new Map();        // chatKey -> timestamp (24h Lead dedup)
 const clickSessions = new Map();    // refCode -> { ref, fbp, fbc, url, product, price, ua, ts }
 const chatAttribution = new Map();  // jid or cleanPhone -> click session object
+const chatQuotedPrice = new Map();  // jid or cleanPhone -> { amount, packageTitle, ts }
+const seenConversations = new Map();// chatKey -> { chatKey, phone, source, product, firstSeenTs, ordered, orderValue, hasFbp, hasFbc }
 const lidToPhoneCache = new Map();  // lid jid -> cleanPhone
-const orderLogs = [];               // recent 100 CAPI attempts
+const orderLogs = [];               // recent 100 CAPI Purchase attempts
+const messageLogs = [];             // recent 50 started conversations
 const skippedLogs = [];             // recent 50 skipped triggers for diagnostics
+
+const funnelStats = {
+    websiteClicks: 0,
+    websiteMessagesStarted: 0,
+    directMessagesStarted: 0,
+    leadsSentToMeta: 0,
+    websiteOrders: 0,
+    directOrders: 0,
+    websiteRevenueUsd: 0,
+    directRevenueUsd: 0
+};
 
 const CLICK_TTL_MS = 7 * 24 * 3600 * 1000;
 const DEDUP_WINDOW_MS = 6 * 3600 * 1000;
+const LEAD_DEDUP_MS = 24 * 3600 * 1000;
 
 function pushRing(arr, item, max = 100) {
     arr.unshift(item);
@@ -172,43 +188,69 @@ function hashSha256(val) {
 }
 
 // --- Price & Trigger Extraction ---
-function extractOrderDetails(text) {
-    // 1. Explicit currency match first (so "70ml" never overrides "$120")
-    const currencyMatch = text.match(/(?:\$|USD|دولار)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:\$|USD|دولار)/i);
-    if (currencyMatch) {
-        const amount = parseFloat(currencyMatch[1] || currencyMatch[2]);
-        if (amount > 0 && amount < 10000) {
-            return { amount, packageTitle: `Confirmed Order ($${amount})` };
-        }
+function normalizeDigits(str) {
+    return String(str || '')
+        .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+        .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0));
+}
+
+function extractExplicitOrTierPrice(text) {
+    const clean = normalizeDigits(text);
+    // 1. Collect explicit currency mentions; prefer >= $15 so a $4 delivery fee never masks order value
+    const matches = [...clean.matchAll(/(?:\$|USD|دولار)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:\$|USD|دولار)/gi)]
+        .map(m => parseFloat(m[1] || m[2]))
+        .filter(n => n > 0 && n < 10000);
+    const productAmounts = matches.filter(n => n >= 15);
+    if (productAmounts.length > 0) {
+        const amount = Math.max(...productAmounts);
+        return { amount, packageTitle: `Order ($${amount})` };
+    }
+    if (matches.length > 0) {
+        const amount = Math.max(...matches);
+        return { amount, packageTitle: `Order ($${amount})` };
     }
 
     // 2. Known Gloramous tiers/sets
-    if (/180|full\s*routine|روتين\s*كامل/i.test(text)) return { amount: 180, packageTitle: "Full Routine ($180)" };
-    if (/145|filler\s*set|مجموعة\s*الفيلر/i.test(text)) return { amount: 145, packageTitle: "Filler Set ($145)" };
-    if (/120|twin|توأم|2\s*set|سيت/i.test(text)) return { amount: 120, packageTitle: "Twin Set ($120)" };
-    if (/110|snail\s*set|مجموعة\s*الحلزون/i.test(text)) return { amount: 110, packageTitle: "Snail Set ($110)" };
-    if (/70|منتجين|قطعتين|2\s*product/i.test(text)) return { amount: 70, packageTitle: "2 Products ($70)" };
-    if (/50|lip\s*care|الشفاه/i.test(text)) return { amount: 50, packageTitle: "Lip Care Set ($50)" };
-    if (/40|منتج\s*واحد|قطعة\s*وحدة|1\s*product/i.test(text)) return { amount: 40, packageTitle: "1 Product ($40)" };
+    if (/180|full\s*routine|روتين\s*كامل/i.test(clean)) return { amount: 180, packageTitle: "Full Routine ($180)" };
+    if (/145|filler\s*set|مجموعة\s*الفيلر/i.test(clean)) return { amount: 145, packageTitle: "Filler Set ($145)" };
+    if (/120|twin|توأم|2\s*set|سيت/i.test(clean)) return { amount: 120, packageTitle: "Twin Set ($120)" };
+    if (/110|snail\s*set|مجموعة\s*الحلزون/i.test(clean)) return { amount: 110, packageTitle: "Snail Set ($110)" };
+    if (/70|منتجين|قطعتين|2\s*product/i.test(clean)) return { amount: 70, packageTitle: "2 Products ($70)" };
+    if (/50|lip\s*care|الشفاه/i.test(clean)) return { amount: 50, packageTitle: "Lip Care Set ($50)" };
+    if (/40|منتج\s*واحد|قطعة\s*وحدة|1\s*product/i.test(clean)) return { amount: 40, packageTitle: "1 Product ($40)" };
 
+    return null;
+}
+
+function extractOrderDetails(text, quotedPrice, attribution) {
+    const direct = extractExplicitOrTierPrice(text);
+    if (direct) return direct;
+    if (quotedPrice && (Date.now() - quotedPrice.ts < LEAD_DEDUP_MS)) {
+        return { amount: quotedPrice.amount, packageTitle: quotedPrice.packageTitle };
+    }
+    const attrPrice = parseFloat(attribution?.price || '');
+    if (attrPrice >= 15 && attrPrice < 10000) {
+        return { amount: attrPrice, packageTitle: attribution.product || `Shopify Product ($${attrPrice})` };
+    }
     return { amount: 120, packageTitle: "Twin Set ($120)" };
 }
 
 function isOrderTrigger(text, fromMe) {
     if (!text) return false;
+    const clean = normalizeDigits(text);
     // Ignore bot's own self-chat receipt
-    if (text.includes('تم تسجيل طلب جديد في إعلانات Meta')) return false;
+    if (clean.includes('تم تسجيل طلب جديد في إعلانات Meta')) return false;
 
     const coreTrigger =
-        /order\s*confirm(?:ed)?/i.test(text) ||
-        /تم\s*(?:تأكيد|تاكيد|تثبيت|اعتماد|تسجيل)\s*الطلب/i.test(text) ||
-        /تم\s*(?:التأكيد|التاكيد|التثبيت)/i.test(text) ||
-        /طلبك\s*(?:مؤكد|تأكد|تثبت)/i.test(text);
+        /order\s*confirm(?:ed)?/i.test(clean) ||
+        /تم\s*(?:تأكيد|تاكيد|تثبيت|اعتماد|تسجيل)\s*الطلب/i.test(clean) ||
+        /تم\s*(?:التأكيد|التاكيد|التثبيت)/i.test(clean) ||
+        /طلبك\s*(?:مؤكد|تأكد|تثبت)/i.test(clean);
 
     if (coreTrigger) return true;
 
     // Outgoing confirmation shorthand with an explicit $ price (e.g., "تم $120" or "✅ $70")
-    if (fromMe && /\$\s*\d+|\d+\s*\$/.test(text) && /(?:تم|confirmed|مؤكد|طلب)/i.test(text)) {
+    if (fromMe && /\$\s*\d+|\d+\s*(?:\$|USD|دولار)/i.test(clean) && /(?:تم|confirmed|مؤكد|طلب)/i.test(clean)) {
         return true;
     }
     return false;
@@ -289,11 +331,11 @@ function sendMetaEvent(payloadObj) {
     });
 }
 
-async function sendMetaPurchase({ phone, amount, packageTitle, pushName, attribution }) {
+async function sendMetaStandardEvent({ eventName, eventPrefix, phone, amount, packageTitle, pushName, attribution }) {
     const cleanPhone = normalizePhone(phone);
     const hashedPhone = hashSha256(cleanPhone);
     const eventTime = Math.floor(Date.now() / 1000);
-    const orderId = `wa_${eventTime}_${cleanPhone.slice(-4)}`;
+    const eventId = `${eventPrefix}_${eventTime}_${cleanPhone.slice(-4)}`;
 
     const userData = {
         ph: [hashedPhone],
@@ -307,17 +349,21 @@ async function sendMetaPurchase({ phone, amount, packageTitle, pushName, attribu
         if (firstName) userData.fn = [hashSha256(firstName)];
     }
 
+    const customData = {
+        content_name: packageTitle || 'WhatsApp Inquiry',
+        content_type: "product"
+    };
+    if (amount && Number(amount) > 0) {
+        customData.currency = "USD";
+        customData.value = Number(amount).toFixed(2);
+    }
+
     const eventObj = {
-        event_name: "Purchase",
+        event_name: eventName,
         event_time: eventTime,
-        event_id: orderId,
+        event_id: eventId,
         user_data: userData,
-        custom_data: {
-            currency: "USD",
-            value: Number(amount).toFixed(2),
-            content_name: packageTitle,
-            content_type: "product"
-        }
+        custom_data: customData
     };
 
     if (attribution && (attribution.fbp || attribution.fbc || attribution.url)) {
@@ -335,12 +381,20 @@ async function sendMetaPurchase({ phone, amount, packageTitle, pushName, attribu
     return {
         success: true,
         cleanPhone,
-        orderId,
+        eventId,
         source: eventObj.action_source,
         hasFbp: !!userData.fbp,
         hasFbc: !!userData.fbc,
         data
     };
+}
+
+function sendMetaPurchase(opts) {
+    return sendMetaStandardEvent({ ...opts, eventName: "Purchase", eventPrefix: "wa" });
+}
+
+function sendMetaLead(opts) {
+    return sendMetaStandardEvent({ ...opts, eventName: "Lead", eventPrefix: "wa_lead" });
 }
 
 let sock = null;
@@ -502,6 +556,7 @@ async function startWhatsApp() {
             const refCode = extractRefCode(text);
             const resolvedPhone = await resolvePhoneFromMessage(msg, text);
             const cleanResolved = resolvedPhone ? normalizePhone(resolvedPhone) : '';
+            const chatKey = cleanResolved || remoteJid;
 
             if (refCode) {
                 const sess = await lookupClickSession(refCode);
@@ -510,6 +565,71 @@ async function startWhatsApp() {
                     if (msg.key.remoteJidAlt) chatAttribution.set(msg.key.remoteJidAlt, sess);
                     if (cleanResolved) chatAttribution.set(cleanResolved, sess);
                     console.log(`[Cloud Bot] 🔗 Linked chat ${remoteJid} to website ref #${refCode} (fbp=${!!sess.fbp}, fbc=${!!sess.fbc})`);
+                }
+            }
+
+            const chatAttr = chatAttribution.get(remoteJid) ||
+                             (msg.key.remoteJidAlt ? chatAttribution.get(msg.key.remoteJidAlt) : null) ||
+                             (cleanResolved ? chatAttribution.get(cleanResolved) : null) ||
+                             (refCode ? await lookupClickSession(refCode) : null);
+
+            // Cache latest discussed product/order price in this chat (ignoring bot receipt)
+            if (!text.includes('تم تسجيل طلب جديد في إعلانات Meta')) {
+                const quoted = extractExplicitOrTierPrice(text);
+                if (quoted) {
+                    const priceEntry = { ...quoted, ts: Date.now() };
+                    chatQuotedPrice.set(remoteJid, priceEntry);
+                    if (cleanResolved) chatQuotedPrice.set(cleanResolved, priceEntry);
+                }
+            }
+
+            // Track incoming customer messages (website-clicked vs direct/ad) & send Lead to Meta CAPI
+            if (!fromMe && !text.includes('تم تسجيل طلب جديد في إعلانات Meta')) {
+                let conv = seenConversations.get(chatKey) || seenConversations.get(remoteJid);
+                if (!conv) {
+                    const convSource = chatAttr ? 'website' : 'direct';
+                    conv = {
+                        ts: new Date().toISOString(),
+                        chatKey,
+                        phone: cleanResolved ? ('+' + cleanResolved) : remoteJid,
+                        source: convSource,
+                        product: chatAttr?.product || '',
+                        ordered: false,
+                        orderValue: 0,
+                        hasFbp: !!chatAttr?.fbp,
+                        hasFbc: !!chatAttr?.fbc
+                    };
+                    seenConversations.set(chatKey, conv);
+                    seenConversations.set(remoteJid, conv);
+                    pushRing(messageLogs, conv, 50);
+                    if (convSource === 'website') {
+                        funnelStats.websiteMessagesStarted++;
+                    } else {
+                        funnelStats.directMessagesStarted++;
+                    }
+                    console.log(`[Cloud Bot] 💬 New ${convSource} WA message started (${conv.phone})`);
+                } else if (chatAttr && conv.source !== 'website') {
+                    // Upgrade attribution if later message carries #GXXXX
+                    conv.source = 'website';
+                    conv.hasFbp = !!chatAttr.fbp;
+                    conv.hasFbc = !!chatAttr.fbc;
+                    funnelStats.directMessagesStarted = Math.max(0, funnelStats.directMessagesStarted - 1);
+                    funnelStats.websiteMessagesStarted++;
+                }
+
+                const nowLead = Date.now();
+                if (resolvedPhone && (!leadSyncs.has(cleanResolved) || nowLead - leadSyncs.get(cleanResolved) >= LEAD_DEDUP_MS)) {
+                    leadSyncs.set(cleanResolved, nowLead);
+                    const leadQuoted = chatQuotedPrice.get(remoteJid) || chatQuotedPrice.get(cleanResolved);
+                    sendMetaLead({
+                        phone: resolvedPhone,
+                        amount: leadQuoted?.amount || chatAttr?.price || 0,
+                        packageTitle: chatAttr?.product || leadQuoted?.packageTitle || 'WhatsApp Inquiry',
+                        pushName: msg.pushName || '',
+                        attribution: chatAttr
+                    }).then(() => {
+                        funnelStats.leadsSentToMeta++;
+                    }).catch(err => console.error('[Cloud Bot] ⚠️ Meta Lead Error:', err.message));
                 }
             }
 
@@ -532,11 +652,9 @@ async function startWhatsApp() {
             }
             recentSyncs.set(cleanKey, now);
 
-            const { amount, packageTitle } = extractOrderDetails(text);
-            const attribution = chatAttribution.get(remoteJid) ||
-                                (msg.key.remoteJidAlt ? chatAttribution.get(msg.key.remoteJidAlt) : null) ||
-                                chatAttribution.get(cleanKey) ||
-                                (refCode ? await lookupClickSession(refCode) : null);
+            const attribution = chatAttr || chatAttribution.get(cleanKey) || null;
+            const quotedPrice = chatQuotedPrice.get(remoteJid) || chatQuotedPrice.get(cleanKey) || null;
+            const { amount, packageTitle } = extractOrderDetails(text, quotedPrice, attribution);
 
             try {
                 const metaRes = await sendMetaPurchase({
@@ -546,6 +664,21 @@ async function startWhatsApp() {
                     pushName: fromMe ? '' : (msg.pushName || ''),
                     attribution
                 });
+
+                const isWebOrder = metaRes.source === 'website';
+                if (isWebOrder) {
+                    funnelStats.websiteOrders++;
+                    funnelStats.websiteRevenueUsd += amount;
+                } else {
+                    funnelStats.directOrders++;
+                    funnelStats.directRevenueUsd += amount;
+                }
+                const convRecord = seenConversations.get(cleanKey) || seenConversations.get(remoteJid);
+                if (convRecord) {
+                    convRecord.ordered = true;
+                    convRecord.orderValue = amount;
+                    convRecord.packageTitle = packageTitle;
+                }
 
                 const entry = {
                     ts: new Date().toISOString(),
@@ -628,6 +761,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (parsedUrl.pathname === '/status') {
+        const totalMsgs = funnelStats.websiteMessagesStarted + funnelStats.directMessagesStarted;
+        const totalOrders = funnelStats.websiteOrders + funnelStats.directOrders;
+        const totalRevenueUsd = Number((funnelStats.websiteRevenueUsd + funnelStats.directRevenueUsd).toFixed(2));
+        const convRatePct = totalMsgs > 0 ? Number(((totalOrders / totalMsgs) * 100).toFixed(1)) : 0;
+        const aovUsd = totalOrders > 0 ? Number((totalRevenueUsd / totalOrders).toFixed(2)) : 0;
+
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
             status: "online",
@@ -641,12 +780,28 @@ const server = http.createServer(async (req, res) => {
                 has_wa_session_env: !!process.env.WA_SESSION,
                 has_local_creds: fs.existsSync(path.join(AUTH_DIR, 'creds.json'))
             },
+            funnel: {
+                website_clicks: funnelStats.websiteClicks,
+                website_messages_started: funnelStats.websiteMessagesStarted,
+                direct_messages_started: funnelStats.directMessagesStarted,
+                total_messages_started: totalMsgs,
+                leads_sent_to_meta: funnelStats.leadsSentToMeta,
+                website_orders: funnelStats.websiteOrders,
+                direct_orders: funnelStats.directOrders,
+                total_orders: totalOrders,
+                website_revenue_usd: Number(funnelStats.websiteRevenueUsd.toFixed(2)),
+                direct_revenue_usd: Number(funnelStats.directRevenueUsd.toFixed(2)),
+                total_revenue_usd: totalRevenueUsd,
+                message_to_order_rate_pct: convRatePct,
+                average_order_value_usd: aovUsd
+            },
             metrics: {
                 active_click_refs: clickSessions.size,
                 linked_chats: chatAttribution.size,
                 tracked_orders_recent: orderLogs.length,
                 skipped_recent: skippedLogs.length
             },
+            recent_messages: messageLogs.slice(0, 20),
             recent_orders: orderLogs.slice(0, 20),
             recent_skipped: skippedLogs.slice(0, 10),
             uptime_seconds: Math.floor(process.uptime())
@@ -694,6 +849,7 @@ const server = http.createServer(async (req, res) => {
                 ts: Date.now()
             };
             await saveClickSession(session);
+            funnelStats.websiteClicks++;
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, ref }));
         } catch (err) {
@@ -717,6 +873,7 @@ const server = http.createServer(async (req, res) => {
             ua: req.headers['user-agent'] || '',
             ts: Date.now()
         });
+        funnelStats.websiteClicks++;
         const baseMsg = parsedUrl.searchParams.get('text') ||
             (product ? `مرحباً 👋 أود طلب ${product}` : 'مرحباً 👋');
         const fullMsg = `${baseMsg}\n[Ref: #${ref}]`;
@@ -730,6 +887,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
 
         if (connectionStatus === "CONNECTED") {
+            const totalMsgs = funnelStats.websiteMessagesStarted + funnelStats.directMessagesStarted;
+            const totalOrders = funnelStats.websiteOrders + funnelStats.directOrders;
+            const totalRev = (funnelStats.websiteRevenueUsd + funnelStats.directRevenueUsd).toFixed(2);
+            const convRate = totalMsgs > 0 ? ((totalOrders / totalMsgs) * 100).toFixed(1) : '0.0';
             res.end(`
                 <!DOCTYPE html>
                 <html>
@@ -737,22 +898,29 @@ const server = http.createServer(async (req, res) => {
                   <meta charset="UTF-8">
                   <title>Gloramous Meta Sync | Connected</title>
                   <style>
-                    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0c111d; color: #fff; text-align: center; padding: 50px 20px; }
-                    .card { background: #161f30; max-width: 520px; margin: 0 auto; padding: 40px; border-radius: 16px; border: 2px solid #25d366; }
-                    .badge { display: inline-block; background: #064e3b; color: #34d399; padding: 8px 18px; border-radius: 20px; font-weight: bold; margin-bottom: 20px; }
+                    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0c111d; color: #fff; text-align: center; padding: 40px 20px; }
+                    .card { background: #161f30; max-width: 560px; margin: 0 auto; padding: 35px; border-radius: 16px; border: 2px solid #25d366; }
+                    .badge { display: inline-block; background: #064e3b; color: #34d399; padding: 8px 18px; border-radius: 20px; font-weight: bold; margin-bottom: 15px; }
+                    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0; text-align: left; }
+                    .stat { background: #0c111d; border-radius: 10px; padding: 12px; font-size: 13px; color: #94a3b8; }
+                    .stat b { display: block; font-size: 20px; color: #fff; margin-top: 3px; }
                   </style>
                 </head>
                 <body>
                   <div class="card">
                     <div class="badge">🟢 24/7 Meta Ads Sync Active</div>
-                    <h1 style="color:#25d366;">Cloud Bot Connected!</h1>
-                    <p style="color:#94a3b8; font-size:16px;">WhatsApp account is linked securely to Meta Pixel <b>${PIXEL_ID}</b>.</p>
-                    <p style="color:#cbd5e1; font-size:14px;">Tracked orders (session): <b>${orderLogs.length}</b> | Active Web Clicks: <b>${clickSessions.size}</b></p>
-                    <div style="background:#0c111d; border-radius:10px; padding:15px; margin-top:20px; font-size:14px; color:#cbd5e1; text-align:left;">
+                    <h1 style="color:#25d366; margin:5px 0;">Cloud Bot Connected!</h1>
+                    <p style="color:#94a3b8; font-size:14px;">Linked to Meta Pixel <b>${PIXEL_ID}</b></p>
+                    <div class="grid">
+                      <div class="stat">Website WA Clicks<b>${funnelStats.websiteClicks}</b></div>
+                      <div class="stat">Website Msgs Started<b>${funnelStats.websiteMessagesStarted}</b></div>
+                      <div class="stat">Direct/Ad Msgs Started<b>${funnelStats.directMessagesStarted}</b></div>
+                      <div class="stat">Orders (${convRate}% conv)<b>${totalOrders} ($${totalRev})</b></div>
+                    </div>
+                    <div style="background:#0c111d; border-radius:10px; padding:15px; margin-top:15px; font-size:13px; color:#cbd5e1; text-align:left;">
                       🔒 <b>100% Privacy Protected:</b><br>
-                      • No personal messages, calls, or chats are visible to anyone.<br>
-                      • Website clicks + WhatsApp orders sync automatically to Meta CAPI.<br>
-                      • View JSON diagnostics anytime at <a href="/status" style="color:#38bdf8;">/status</a>.
+                      • Tracks website clicks ➔ real WA messages (Lead) ➔ confirmed orders + exact $ value (Purchase).<br>
+                      • Live JSON funnel & order log: <a href="/status" style="color:#38bdf8;">/status</a>
                     </div>
                   </div>
                 </body>

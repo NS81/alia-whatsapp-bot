@@ -54,8 +54,8 @@
     var fbp = getCookie('_fbp');
     var fbc = getFbc();
 
-    // 1. Fire Meta Pixel Contact standard event
-    if (typeof fbq === 'function') {
+    // 1. Fire Meta Pixel Contact once (assets/wa.js handles Contact for a[href*="wa.me"])
+    if (!target.closest('a[href*="wa.me"]') && typeof fbq === 'function') {
       fbq('track', 'Contact', {
         content_name: prod.title || 'WhatsApp Button Click',
         content_category: 'WhatsApp',
