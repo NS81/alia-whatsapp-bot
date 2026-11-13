@@ -97,9 +97,22 @@ function restoreAuthBundleB64(b64, label) {
         const parsed = JSON.parse(decoded);
         if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
         if (parsed.noiseKey || parsed.registrationId || parsed.me) {
+            if (!parsed.registered) {
+                console.log(`[Cloud Bot] ⚠️ Skipping unregistered creds.json in ${label}`);
+                return false;
+            }
             fs.writeFileSync(path.join(AUTH_DIR, 'creds.json'), decoded, 'utf-8');
             console.log(`[Cloud Bot] ✅ Restored creds.json from ${label}`);
             return true;
+        }
+        if (parsed['creds.json']) {
+            try {
+                const c = typeof parsed['creds.json'] === 'string' ? JSON.parse(parsed['creds.json']) : parsed['creds.json'];
+                if (!c.registered) {
+                    console.log(`[Cloud Bot] ⚠️ Skipping unregistered session bundle in ${label}`);
+                    return false;
+                }
+            } catch (_) {}
         }
         let count = 0;
         for (const [filename, content] of Object.entries(parsed)) {
@@ -117,9 +130,11 @@ function restoreAuthBundleB64(b64, label) {
 
 let persistTimer = null;
 function scheduleSessionPersist() {
+    if (!sock?.authState?.creds?.registered) return;
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(async () => {
         try {
+            if (!sock?.authState?.creds?.registered) return;
             const b64 = buildAuthBundleB64();
             if (!b64) return;
             if (UPSTASH_URL && UPSTASH_TOKEN) {
@@ -413,7 +428,9 @@ async function startWhatsApp() {
 
     sock.ev.on('creds.update', async () => {
         await saveCreds();
-        scheduleSessionPersist();
+        if (sock?.authState?.creds?.registered) {
+            scheduleSessionPersist();
+        }
     });
 
     // Keep LID -> Phone cache warm from contact updates
@@ -444,8 +461,12 @@ async function startWhatsApp() {
             if (shouldReconnect) {
                 setTimeout(() => startWhatsApp().catch(err => console.error('[Restart Error]', err)), 3000);
             } else {
-                console.log('[Cloud Bot] Session logged out. Resetting auth dir...');
+                console.log('[Cloud Bot] Session logged out. Resetting auth dir & saved session...');
+                process.env.WA_SESSION = '';
                 try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+                if (RENDER_API_KEY && RENDER_SERVICE_ID) {
+                    syncSessionToRenderEnv('').catch(() => {});
+                }
                 setTimeout(() => startWhatsApp().catch(err => console.error('[Restart Error]', err)), 3000);
             }
         } else if (connection === 'open') {
