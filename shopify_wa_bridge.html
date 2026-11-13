@@ -1,0 +1,110 @@
+<!-- Antigravity Meta Pixel WhatsApp Click & Attribution Bridge (v2) -->
+<script>
+(function() {
+  var BOT_CLICK_URL = 'https://alia-whatsapp-bot.onrender.com/click';
+
+  function getCookie(name) {
+    var m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
+  // Persist fbclid across multi-page browsing so _fbc is never lost
+  try {
+    var urlParams = new URLSearchParams(window.location.search);
+    var fbclid = urlParams.get('fbclid');
+    if (fbclid) {
+      var fbcVal = 'fb.1.' + Date.now() + '.' + fbclid;
+      localStorage.setItem('gl_fbc', fbcVal);
+    }
+  } catch (_) {}
+
+  function getFbc() {
+    return getCookie('_fbc') || (function() { try { return localStorage.getItem('gl_fbc') || ''; } catch (_) { return ''; } })();
+  }
+
+  function genRef() {
+    var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    var out = 'G';
+    for (var i = 0; i < 5; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
+  }
+
+  function detectProduct() {
+    var title = '';
+    var price = '';
+    if (window.meta && window.meta.product) {
+      title = window.meta.product.title || '';
+      if (window.meta.product.variants && window.meta.product.variants[0]) {
+        price = (window.meta.product.variants[0].price / 100).toFixed(2);
+      }
+    }
+    if (!title && window.location.pathname.indexOf('/products/') !== -1) {
+      var h1 = document.querySelector('h1');
+      if (h1) title = h1.innerText.trim();
+    }
+    return { title: title, price: price };
+  }
+
+  function handleWhatsAppClick(e) {
+    var target = e.target.closest('a[href*="wa.me"], a[href*="whatsapp.com"], [class*="whatsapp" i], [id*="whatsapp" i]');
+    if (!target) return;
+
+    var prod = detectProduct();
+    var ref = genRef();
+    var fbp = getCookie('_fbp');
+    var fbc = getFbc();
+
+    // 1. Fire Meta Pixel Contact standard event
+    if (typeof fbq === 'function') {
+      fbq('track', 'Contact', {
+        content_name: prod.title || 'WhatsApp Button Click',
+        content_category: 'WhatsApp',
+        value: prod.price ? Number(prod.price) : undefined,
+        currency: prod.price ? 'USD' : undefined,
+        page_title: document.title,
+        page_url: window.location.href
+      });
+    }
+
+    // 2. Send fbp/fbc/url to Cloud Bot asynchronously in 0ms (never blocks wa.me navigation)
+    var payload = JSON.stringify({
+      ref: ref,
+      fbp: fbp,
+      fbc: fbc,
+      url: window.location.href,
+      product: prod.title,
+      price: prod.price,
+      ua: navigator.userAgent
+    });
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(BOT_CLICK_URL, new Blob([payload], { type: 'text/plain' }));
+      } else {
+        fetch(BOT_CLICK_URL, { method: 'POST', body: payload, keepalive: true, headers: { 'Content-Type': 'application/json' } }).catch(function(){});
+      }
+    } catch (_) {}
+
+    // 3. Attach [Ref: #GXXXX] (and product context if missing) to the wa.me link
+    try {
+      var anchor = target.tagName === 'A' ? target : target.querySelector('a');
+      if (anchor && anchor.href && (anchor.href.includes('wa.me') || anchor.href.includes('whatsapp.com'))) {
+        var u = new URL(anchor.href);
+        var existingText = u.searchParams.get('text') || '';
+        if (!/\[Ref:\s*#?G[A-Z0-9]{4,8}\]/i.test(existingText)) {
+          var baseMsg = existingText
+            ? existingText
+            : (prod.title
+                ? "مرحباً 👋 أود طلب: " + prod.title + (prod.price ? " ($" + prod.price + ")" : "")
+                : "مرحباً 👋 أريد الاستفسار والطلب من الموقع");
+          u.searchParams.set('text', baseMsg + "\n[Ref: #" + ref + "]");
+          anchor.href = u.toString();
+        }
+      }
+    } catch (err) {
+      console.error('Gloramous WA bridge error:', err);
+    }
+  }
+
+  document.addEventListener('click', handleWhatsAppClick, true);
+})();
+</script>

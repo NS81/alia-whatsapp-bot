@@ -332,6 +332,7 @@ let sock = null;
 let currentPairingCode = null;
 let connectionStatus = "INITIALIZING";
 let currentQR = null;
+let qrVersion = 0;
 let startedOnce = false;
 
 async function resolvePhoneFromMessage(msg, text) {
@@ -428,6 +429,8 @@ async function startWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
             currentQR = qr;
+            qrVersion++;
+            connectionStatus = "WAITING_FOR_SCAN";
             console.log('[Cloud Bot] 🎯 QR Code received from WhatsApp! Ready for scanning.');
         }
 
@@ -595,6 +598,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             ok: true,
             connection: connectionStatus,
+            qrVersion,
             jid: sock?.user?.id || null,
             uptime: Math.floor(process.uptime())
         }));
@@ -743,28 +747,47 @@ const server = http.createServer(async (req, res) => {
                 <img src="${qrUrl}" width="260" height="260" alt="WhatsApp QR Code" />
               </div>
               <p style="color:#cbd5e1; font-size:15px;">Open WhatsApp on phone ➔ <b>Settings</b> ➔ <b>Linked Devices</b> ➔ <b>Link a Device</b> ➔ Scan this QR</p>
+              <p style="color:#94a3b8; font-size:12px;">QR stays steady until WhatsApp rotates it (~20-60s). Need remote linking? Use an 8-digit code below:</p>
+              <a href="/pair?phone=96176954792" style="display:inline-block; margin-top:8px; background:#25d366; color:#0c111d; text-decoration:none; font-weight:bold; padding:10px 18px; border-radius:8px; font-size:14px;">Link with Phone Number (+961 76 954 792)</a>
             `;
         } else {
             qrSection = `
               <div style="padding:40px; background:#161f30; border-radius:12px; display:inline-block; margin:20px auto;">
                 <p style="color:#38bdf8; font-size:18px;">Initializing secure connection to WhatsApp...</p>
-                <p style="color:#94a3b8; font-size:14px;">Refreshing automatically in 3 seconds...</p>
+                <p style="color:#94a3b8; font-size:14px;">Waiting for fresh QR code...</p>
               </div>
             `;
         }
 
+        const renderedQrVer = currentQR ? qrVersion : 0;
         res.end(`
             <!DOCTYPE html>
             <html>
             <head>
               <meta charset="UTF-8">
-              <meta http-equiv="refresh" content="5">
               <title>Gloramous Meta Sync Gateway</title>
               <style>
                 body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0c111d; color: #fff; text-align: center; padding: 40px 15px; }
                 .card { background: #161f30; max-width: 520px; margin: 0 auto; padding: 35px; border-radius: 16px; border: 1px solid #1f2a3d; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
                 h1 { color: #25d366; font-size: 24px; margin-bottom: 5px; }
               </style>
+              <script>
+                (function() {
+                  var initialQrVer = ${renderedQrVer};
+                  setInterval(function() {
+                    fetch('/health')
+                      .then(function(r) { return r.json(); })
+                      .then(function(d) {
+                        if (d.connection === 'CONNECTED') {
+                          location.reload();
+                        } else if (d.qrVersion && d.qrVersion !== initialQrVer) {
+                          location.reload();
+                        }
+                      })
+                      .catch(function() {});
+                  }, 3000);
+                })();
+              </script>
             </head>
             <body>
               <div class="card">
