@@ -407,7 +407,8 @@ async function startWhatsApp() {
         browser: Browsers.ubuntu('Chrome'),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
-        keepAliveIntervalMs: 10000
+        keepAliveIntervalMs: 10000,
+        qrTimeout: 120000
     });
 
     sock.ev.on('creds.update', async () => {
@@ -747,7 +748,7 @@ const server = http.createServer(async (req, res) => {
                 <img src="${qrUrl}" width="260" height="260" alt="WhatsApp QR Code" />
               </div>
               <p style="color:#cbd5e1; font-size:15px;">Open WhatsApp on phone ➔ <b>Settings</b> ➔ <b>Linked Devices</b> ➔ <b>Link a Device</b> ➔ Scan this QR</p>
-              <p style="color:#94a3b8; font-size:12px;">QR stays steady until WhatsApp rotates it (~20-60s). Need remote linking? Use an 8-digit code below:</p>
+              <p style="color:#94a3b8; font-size:12px;">QR stays steady for up to ~2 minutes until WhatsApp rotates it. Need remote linking? Use an 8-digit code below:</p>
               <a href="/pair?phone=96176954792" style="display:inline-block; margin-top:8px; background:#25d366; color:#0c111d; text-decoration:none; font-weight:bold; padding:10px 18px; border-radius:8px; font-size:14px;">Link with Phone Number (+961 76 954 792)</a>
             `;
         } else {
