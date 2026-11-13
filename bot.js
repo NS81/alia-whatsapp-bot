@@ -114,6 +114,10 @@ function buildAuthBundleB64(full = false) {
     return 'GZ:' + gz.toString('base64');
 }
 
+function isCredsLinked(creds) {
+    return Boolean(creds && (creds.registered || creds.me?.id));
+}
+
 function restoreAuthBundleB64(b64, label) {
     try {
         const raw = String(b64).trim();
@@ -128,7 +132,7 @@ function restoreAuthBundleB64(b64, label) {
         const parsed = JSON.parse(decoded);
         if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
         if (parsed.noiseKey || parsed.registrationId || parsed.me) {
-            if (!parsed.registered) {
+            if (!isCredsLinked(parsed)) {
                 console.log(`[Cloud Bot] ⚠️ Skipping unregistered creds.json in ${label}`);
                 return false;
             }
@@ -139,7 +143,7 @@ function restoreAuthBundleB64(b64, label) {
         if (parsed['creds.json']) {
             try {
                 const c = typeof parsed['creds.json'] === 'string' ? JSON.parse(parsed['creds.json']) : parsed['creds.json'];
-                if (!c.registered) {
+                if (!isCredsLinked(c)) {
                     console.log(`[Cloud Bot] ⚠️ Skipping unregistered session bundle in ${label}`);
                     return false;
                 }
@@ -161,12 +165,12 @@ function restoreAuthBundleB64(b64, label) {
 
 let persistTimer = null;
 function scheduleSessionPersist() {
-    if (!sock?.authState?.creds?.registered) return;
+    if (!isCredsLinked(sock?.authState?.creds)) return;
     if (persistTimer) return;
     persistTimer = setTimeout(async () => {
         persistTimer = null;
         try {
-            if (!sock?.authState?.creds?.registered) return;
+            if (!isCredsLinked(sock?.authState?.creds)) return;
             const b64 = buildAuthBundleB64(false);
             if (!b64) return;
             if (UPSTASH_URL && UPSTASH_TOKEN) {
@@ -498,7 +502,7 @@ async function startWhatsApp() {
 
     sock.ev.on('creds.update', async () => {
         await saveCreds();
-        if (sock?.authState?.creds?.registered) {
+        if (isCredsLinked(sock?.authState?.creds)) {
             scheduleSessionPersist();
         }
     });
@@ -1018,7 +1022,7 @@ const server = http.createServer(async (req, res) => {
         const cleanPhone = phone.replace(/[^0-9]/g, '');
 
         try {
-            if (sock?.authState?.creds?.registered) {
+            if (isCredsLinked(sock?.authState?.creds)) {
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(`<h2 style="font-family:sans-serif; text-align:center; padding:50px; color:#25d366;">🎉 WhatsApp Bot is ALREADY CONNECTED to +${cleanPhone}!</h2>`);
                 return;
