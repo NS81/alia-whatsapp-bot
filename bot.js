@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const https = require('https');
+const zlib = require('zlib');
 
 const PORT = process.env.PORT || 10000;
 const PIXEL_ID = process.env.META_PIXEL_ID || "1099322255975263";
@@ -92,23 +93,37 @@ async function syncSessionToRenderEnv(b64Bundle) {
     return false;
 }
 
-function buildAuthBundleB64() {
+const ESSENTIAL_AUTH_RE = /^(?:creds\.json|app-state-sync-key-|session-|identity-key-|pre-key-|device-list)/;
+
+function buildAuthBundleB64(full = false) {
     if (!fs.existsSync(AUTH_DIR)) return null;
     const files = fs.readdirSync(AUTH_DIR);
     if (!files.includes('creds.json')) return null;
     const bundle = {};
     for (const file of files) {
+        if (!full && !ESSENTIAL_AUTH_RE.test(file)) continue;
         const fp = path.join(AUTH_DIR, file);
         if (fs.statSync(fp).isFile()) {
             bundle[file] = fs.readFileSync(fp, 'utf-8');
         }
     }
-    return Buffer.from(JSON.stringify(bundle)).toString('base64');
+    if (full) {
+        return Buffer.from(JSON.stringify(bundle)).toString('base64');
+    }
+    const gz = zlib.gzipSync(Buffer.from(JSON.stringify(bundle), 'utf-8'));
+    return 'GZ:' + gz.toString('base64');
 }
 
 function restoreAuthBundleB64(b64, label) {
     try {
-        const decoded = Buffer.from(String(b64).trim(), 'base64').toString('utf-8');
+        const raw = String(b64).trim();
+        let decoded;
+        if (raw.startsWith('GZ:')) {
+            const gzBuf = Buffer.from(raw.slice(3), 'base64');
+            decoded = zlib.gunzipSync(gzBuf).toString('utf-8');
+        } else {
+            decoded = Buffer.from(raw, 'base64').toString('utf-8');
+        }
         if (!decoded.trim().startsWith('{')) return false;
         const parsed = JSON.parse(decoded);
         if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -147,11 +162,12 @@ function restoreAuthBundleB64(b64, label) {
 let persistTimer = null;
 function scheduleSessionPersist() {
     if (!sock?.authState?.creds?.registered) return;
-    if (persistTimer) clearTimeout(persistTimer);
+    if (persistTimer) return;
     persistTimer = setTimeout(async () => {
+        persistTimer = null;
         try {
             if (!sock?.authState?.creds?.registered) return;
-            const b64 = buildAuthBundleB64();
+            const b64 = buildAuthBundleB64(false);
             if (!b64) return;
             if (UPSTASH_URL && UPSTASH_TOKEN) {
                 await redisCommand(['SET', 'gloramous:wa_session_b64', b64]);
@@ -477,7 +493,7 @@ async function startWhatsApp() {
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 10000,
-        qrTimeout: 120000
+        qrTimeout: 300000
     });
 
     sock.ev.on('creds.update', async () => {
@@ -937,7 +953,7 @@ const server = http.createServer(async (req, res) => {
                 <img src="${qrUrl}" width="260" height="260" alt="WhatsApp QR Code" />
               </div>
               <p style="color:#cbd5e1; font-size:15px;">Open WhatsApp on phone ➔ <b>Settings</b> ➔ <b>Linked Devices</b> ➔ <b>Link a Device</b> ➔ Scan this QR</p>
-              <p style="color:#94a3b8; font-size:12px;">QR stays steady for up to ~2 minutes until WhatsApp rotates it. Need remote linking? Use an 8-digit code below:</p>
+              <p style="color:#94a3b8; font-size:12px;">Client QR wait window is set to 5 minutes (WhatsApp's server also refreshes/closes unlinked sockets periodically). Need remote linking? Use an 8-digit code below:</p>
               <a href="/pair?phone=96176954792" style="display:inline-block; margin-top:8px; background:#25d366; color:#0c111d; text-decoration:none; font-weight:bold; padding:10px 18px; border-radius:8px; font-size:14px;">Link with Phone Number (+961 76 954 792)</a>
             `;
         } else {
